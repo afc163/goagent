@@ -2250,23 +2250,17 @@ def expand_google_hk_iplist(domains, max_count=100):
     logging.info('expand_google_hk_iplist end. iplist=%s', ip_connection_time)
 
 
-class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
+class GAEProxyHandler(SimpleProxyHandler):
 
-    bufsize = 256*1024
     first_run_lock = threading.Lock()
-    urlfetch = staticmethod(gae_urlfetch)
-    normcookie = functools.partial(re.compile(', ([^ =]+(?:=|$))').sub, '\\r\\nSet-Cookie: \\1')
-    normattachment = functools.partial(re.compile(r'filename=([^"\']+)').sub, 'filename="\\1"')
     geoip = pygeoip.GeoIP('GeoIP.dat') if pygeoip and common.GAE_REGIONS else None
+    dns = {}
 
     def first_run(self):
         """GAEProxyHandler setup, init domain/iplist map"""
         if common.GAE_VALIDATE or common.GAE_OBFUSCATE:
             http_util.set_openssl_option(validate=common.GAE_VALIDATE, obfuscate=common.GAE_OBFUSCATE)
         if not common.PROXY_ENABLE:
-            if 'google_hk' in common.IPLIST_MAP:
-                # threading._start_new_thread(expand_google_hk_iplist, (common.IPLIST_MAP['google_hk'][:], 16))
-                pass
             logging.info('resolve common.IPLIST_MAP names=%s to iplist', list(common.IPLIST_MAP))
             common.resolve_iplist()
         if len(common.GAE_APPIDS) > 10:
@@ -2275,148 +2269,78 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             host = '%s.appspot.com' % appid
             if host not in common.HOSTS_MAP:
                 common.HOSTS_MAP[host] = common.HOSTS_POSTFIX_MAP['.appspot.com']
-            if host not in http_util.dns:
-                http_util.dns[host] = common.IPLIST_MAP[common.HOSTS_MAP[host]]
+            if host not in self.dns:
+                self.dns[host] = common.IPLIST_MAP[common.HOSTS_MAP[host]]
 
-    def setup(self):
-        if isinstance(self.__class__.first_run, collections.Callable):
-            try:
-                with self.__class__.first_run_lock:
-                    if isinstance(self.__class__.first_run, collections.Callable):
-                        self.first_run()
-                        self.__class__.first_run = None
-            except Exception as e:
-                logging.exception('GAEProxyHandler.first_run() return %r', e)
-        self.__class__.setup = BaseHTTPServer.BaseHTTPRequestHandler.setup
-        self.__class__.do_GET = self.__class__.do_METHOD
-        self.__class__.do_PUT = self.__class__.do_METHOD
-        self.__class__.do_POST = self.__class__.do_METHOD
-        self.__class__.do_HEAD = self.__class__.do_METHOD
-        self.__class__.do_DELETE = self.__class__.do_METHOD
-        self.__class__.do_OPTIONS = self.__class__.do_METHOD
-        self.setup()
-
-    def finish(self):
-        """make python2 BaseHTTPRequestHandler happy"""
-        try:
-            BaseHTTPServer.BaseHTTPRequestHandler.finish(self)
-        except NetWorkIOError as e:
-            if e[0] not in (errno.ECONNABORTED, errno.ECONNRESET, errno.EPIPE):
-                raise
-
-    def address_string(self):
-        return '%s:%s' % self.client_address[:2]
+    def __urlfetch(self, method, url, headers, body, fetchserver, **kwargs):
+        return gae_urlfetch(method, url, headers, body, fetchserver, **kwargs)
 
     def do_METHOD(self):
-        if HAS_PYPY:
-            self.path = re.sub(r'(://[^/]+):\d+/', '\\1/', self.path)
+        if self.command == 'CONNECT':
+            host, _, port = self.path.partition(':')
+            need_forward = False
+            if self.path in common.CONNECT_HOSTS_MAP or self.path.endswith(common.CONNECT_POSTFIX_ENDSWITH):
+                need_forward = True
+            elif host in common.HOSTS_MAP or host.endswith(common.HOSTS_POSTFIX_ENDSWITH):
+                need_forward = True
+            if common.GAE_REGIONS:
+                iplist = http_util.dns_resolve(host)
+                # http://dev.maxmind.com/geoip/legacy/codes/iso3166/
+                if iplist and self.geoip.country_code_by_addr(iplist[0]) in common.GAE_REGIONS:
+                    need_forward = True
+            if host in common.HTTP_FAKEHTTPS or host in common.HTTP_WITHGAE:
+                need_forward = False
+            if need_forward:
+                if self.path in common.CONNECT_HOSTS_MAP:
+                    hostname = common.CONNECT_HOSTS_MAP[self.path]
+                elif self.path.endswith(common.CONNECT_POSTFIX_ENDSWITH):
+                    hostname = next(common.CONNECT_POSTFIX_MAP[x] for x in common.CONNECT_POSTFIX_MAP if self.path.endswith(x))
+                    common.CONNECT_HOSTS_MAP[self.path] = hostname
+                elif host in common.HOSTS_MAP:
+                    hostname = common.HOSTS_MAP[host]
+                elif host.endswith(common.HOSTS_POSTFIX_ENDSWITH):
+                    hostname = next(common.HOSTS_POSTFIX_MAP[x] for x in common.HOSTS_POSTFIX_MAP if host.endswith(x))
+                    common.HOSTS_MAP[host] = hostname
+                else:
+                    hostname = host
+                hostname = hostname or host
+                if hostname in common.IPLIST_MAP:
+                    http_util.dns[host] = common.IPLIST_MAP[hostname]
+                else:
+                    http_util.dns[host] = sum((http_util.dns_resolve(x) for x in hostname.split('|')), [])
+                return self.do_METHOD_FORWARD(hostname, int(port), 16)
+            else:
+                return self.do_METHOD_STRIPSSL()
         host = self.headers.get('Host', '')
         if self.path[0] == '/' and host:
             self.path = 'http://%s%s' % (host, self.path)
         elif not host and '://' in self.path:
             host = urlparse.urlsplit(self.path).netloc
-        self.url_parts = urlparse.urlsplit(self.path)
+        urlparts = urlparse.urlsplit(self.path)
         if common.USERAGENT_ENABLE:
             self.headers['User-Agent'] = common.USERAGENT_STRING
-        if host in common.HTTP_WITHGAE:
-            return self.do_METHOD_AGENT()
+        need_urlfetch = True
         if host in common.HTTP_FORCEHTTPS and not self.headers.get('Referer', '').startswith('https://') and not self.path.startswith('https://'):
-            return self.wfile.write(('HTTP/1.1 301\r\nLocation: %s\r\n\r\n' % self.path.replace('http://', 'https://', 1)).encode())
+            return self.do_METHOD_MOCK(301, {'Location': self.path.replace('http://', 'https://', 1)}, '')
         if self.command not in ('GET', 'POST', 'HEAD', 'PUT', 'DELETE', 'PATCH'):
-            return self.do_METHOD_FWD()
+            need_urlfetch = False
         if any(x(self.path) for x in common.METHOD_REMATCH_MAP) or host in common.HOSTS_MAP or host.endswith(common.HOSTS_POSTFIX_ENDSWITH):
-            return self.do_METHOD_FWD()
+            need_urlfetch = False
         if common.GAE_REGIONS:
             iplist = http_util.dns_resolve(host)
             # http://dev.maxmind.com/geoip/legacy/codes/iso3166/
             if iplist and self.geoip.country_code_by_addr(iplist[0]) in common.GAE_REGIONS:
-                return self.do_METHOD_FWD()
-        return self.do_METHOD_AGENT()
+                need_urlfetch = False
+        if host in common.HTTP_WITHGAE:
+            need_urlfetch = True
+        if not need_urlfetch:
+            return SimpleProxyHandler.do_METHOD_URLFETCH(self, '<local>')
 
-    def do_METHOD_FWD(self):
-        """Direct http forward"""
-        response = None
-        try:
-            content_length = int(self.headers.get('Content-Length', 0))
-            payload = self.rfile.read(content_length) if content_length else b''
-            host = self.url_parts.netloc
-            if any(x(self.path) for x in common.METHOD_REMATCH_MAP):
-                hostname = next(common.METHOD_REMATCH_MAP[x] for x in common.METHOD_REMATCH_MAP if x(self.path))
-            elif host in common.HOSTS_MAP:
-                hostname = common.HOSTS_MAP[host]
-            elif host.endswith(common.HOSTS_POSTFIX_ENDSWITH):
-                hostname = next(common.HOSTS_POSTFIX_MAP[x] for x in common.HOSTS_POSTFIX_MAP if host.endswith(x))
-                common.HOSTS_MAP[host] = hostname
-            else:
-                hostname = host
-            if common.METHOD_REMATCH_HAS_LOCALFILE and hostname.startswith('file://'):
-                filename = hostname.lstrip('file://')
-                if os.name == 'nt':
-                    filename = filename.lstrip('/')
-                content_type = None
-                try:
-                    import mimetypes
-                    content_type = mimetypes.types_map.get(os.path.splitext(filename)[1])
-                except Exception as e:
-                    logging.error('import mimetypes failed: %r', e)
-                try:
-                    with open(filename, 'rb') as fp:
-                        data = fp.read()
-                        self.wfile.write('HTTP/1.1 200\r\n')
-                        self.wfile.write('Connection: close\r\n')
-                        self.wfile.write('Content-Length: %s\r\n' % len(data))
-                        if content_type:
-                            self.wfile.write('Content-Type: %s\r\n' % content_type)
-                        self.wfile.write('\r\n')
-                        self.wfile.write(data)
-                except Exception as e:
-                    self.wfile.write('HTTP/1.1 403\r\n')
-                    self.wfile.write('Connection: close\r\n')
-                    self.wfile.write('\r\n')
-                    self.wfile.write('open %r failed: %r' % (filename, e))
-                finally:
-                    logging.info('%r matched local file %r, return', self.path, filename)
-                    return
-            need_crlf = host.endswith(common.HTTP_CRLFSITES)
-            hostname = hostname or host
-            if hostname in common.IPLIST_MAP:
-                http_util.dns[host] = common.IPLIST_MAP[hostname]
-            else:
-                http_util.dns[host] = sum((http_util.dns_resolve(x) for x in hostname.split('|')), [])
-            validate = common.GAE_VALIDATE if host not in common.HTTP_FAKEHTTPS else None
-            connection_cache_key = hostname if host not in common.HTTP_FAKEHTTPS else None
-            response = http_util.request(self.command, self.path, payload, self.headers, crlf=need_crlf, validate=validate, connection_cache_key=connection_cache_key)
-            if not response:
-                return
-            logging.info('%s "FWD %s %s HTTP/1.1" %s %s', self.address_string(), self.command, self.path, response.status, response.getheader('Content-Length', '-'))
-            self.wfile.write(('HTTP/1.1 %s %s\r\n%s\r\n' % (response.status, httplib.responses.get(response.status, 'Unkown'), ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))))
-            while True:
-                data = response.read(8192)
-                if not data:
-                    break
-                self.wfile.write(data)
-                del data
-            response.close()
-        except NetWorkIOError as e:
-            if response:
-                response.close()
-            if e.args[0] in (errno.ECONNRESET, 10063, errno.ENAMETOOLONG):
-                logging.warn('http_util.request "%s %s" failed:%s, try addto `withgae`', self.command, self.path, e)
-                common.HTTP_WITHGAE.add(re.sub(r':\d+$', '', self.url_parts.netloc))
-            elif e.args[0] not in (errno.ECONNABORTED, errno.EPIPE):
-                raise
-        except Exception as e:
-            host = self.headers.get('Host', '')
-            logging.warn('GAEProxyHandler direct(%s) Error', host)
-            raise
-
-    def do_METHOD_AGENT(self):
-        """GAE http urlfetch"""
         request_headers = dict((k.title(), v) for k, v in self.headers.items())
         host = request_headers.get('Host', '')
-        path = self.url_parts.path
+        path = urlparts.path
         need_autorange = any(x(host) for x in common.AUTORANGE_HOSTS_MATCH) or path.endswith(common.AUTORANGE_ENDSWITH)
-        if path.endswith(common.AUTORANGE_NOENDSWITH) or 'range=' in self.url_parts.query or self.command == 'HEAD':
+        if path.endswith(common.AUTORANGE_NOENDSWITH) or 'range=' in urlparts.query or self.command == 'HEAD':
             need_autorange = False
         if self.command != 'HEAD' and 'Range' in request_headers:
             m = re.search(r'bytes=(\d+)-', request_headers['Range'])
@@ -2449,7 +2373,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     kwargs['password'] = common.GAE_PASSWORD
                 if common.GAE_VALIDATE:
                     kwargs['validate'] = 1
-                response = self.urlfetch(self.command, self.path, request_headers, payload, fetchserver, **kwargs)
+                response = self.__urlfetch(self.command, self.path, request_headers, payload, fetchserver, **kwargs)
                 if not response and retry == common.FETCHMAX_LOCAL-1:
                     html = message_html('502 URLFetch failed', 'Local URLFetch %r failed' % self.path, str(errors))
                     self.wfile.write(b'HTTP/1.0 502\r\nContent-Type: text/html\r\n\r\n' + html.encode('utf-8'))
@@ -2475,7 +2399,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     if len(common.GAE_APPIDS) > 1:
                         common.GAE_APPIDS.pop(0)
                         logging.info('Current APPID Over Quota,Auto Switch to [%s], Retrying…' % (common.GAE_APPIDS[0]))
-                        self.do_METHOD_AGENT()
+                        self.do_METHOD()
                         return
                     else:
                         logging.error('All APPID Over Quota')
@@ -2509,9 +2433,9 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 content_range = response.getheader('Content-Range', '')
                 accept_ranges = response.getheader('Accept-Ranges', 'none')
                 if content_range:
-                    start, end, length = tuple(int(x) for x in re.search(r'bytes (\d+)-(\d+)/(\d+)', content_range).group(1, 2, 3))
+                    start, end, _ = tuple(int(x) for x in re.search(r'bytes (\d+)-(\d+)/(\d+)', content_range).group(1, 2, 3))
                 else:
-                    start, end, length = 0, content_length-1, content_length
+                    start, end, _ = 0, content_length-1, content_length
                 while True:
                     data = response.read(8192)
                     if not data:
@@ -2542,141 +2466,6 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     return
                 else:
                     logging.exception('GAEProxyHandler.do_METHOD_AGENT %r return %r, try again', self.path, e)
-
-    def do_CONNECT(self):
-        """handle CONNECT cmmand, socket forward or deploy a fake cert"""
-        host, _, port = self.path.rpartition(':')
-        if host in common.HTTP_FAKEHTTPS or host in common.HTTP_WITHGAE:
-            return self.do_CONNECT_AGENT()
-        elif self.path in common.CONNECT_HOSTS_MAP or self.path.endswith(common.CONNECT_POSTFIX_ENDSWITH):
-            return self.do_CONNECT_FWD()
-        elif host in common.HOSTS_MAP or host.endswith(common.HOSTS_POSTFIX_ENDSWITH):
-            return self.do_CONNECT_FWD()
-        if common.GAE_REGIONS:
-            iplist = http_util.dns_resolve(host)
-            # http://dev.maxmind.com/geoip/legacy/codes/iso3166/
-            if iplist and self.geoip.country_code_by_addr(iplist[0]) in common.GAE_REGIONS:
-                return self.do_CONNECT_FWD()
-        return self.do_CONNECT_AGENT()
-
-    def do_CONNECT_FWD(self):
-        """socket forward for http CONNECT command"""
-        host, _, port = self.path.rpartition(':')
-        port = int(port)
-        logging.info('%s "FWD %s %s:%d HTTP/1.1" - -', self.address_string(), self.command, host, port)
-        #http_headers = ''.join('%s: %s\r\n' % (k, v) for k, v in self.headers.items())
-        if not common.PROXY_ENABLE:
-            self.wfile.write(b'HTTP/1.1 200 OK\r\n\r\n')
-            data = self.connection.recv(1024)
-            for i in range(5):
-                try:
-                    if self.path in common.CONNECT_HOSTS_MAP:
-                        hostname = common.CONNECT_HOSTS_MAP[self.path]
-                    elif self.path.endswith(common.CONNECT_POSTFIX_ENDSWITH):
-                        hostname = next(common.CONNECT_POSTFIX_MAP[x] for x in common.CONNECT_POSTFIX_MAP if self.path.endswith(x))
-                        common.CONNECT_HOSTS_MAP[self.path] = hostname
-                    elif host in common.HOSTS_MAP:
-                        hostname = common.HOSTS_MAP[host]
-                    elif host.endswith(common.HOSTS_POSTFIX_ENDSWITH):
-                        hostname = next(common.HOSTS_POSTFIX_MAP[x] for x in common.HOSTS_POSTFIX_MAP if host.endswith(x))
-                        common.HOSTS_MAP[host] = hostname
-                    else:
-                        hostname = host
-                    hostname = hostname or host
-                    if hostname in common.IPLIST_MAP:
-                        http_util.dns[host] = common.IPLIST_MAP[hostname]
-                    else:
-                        http_util.dns[host] = sum((http_util.dns_resolve(x) for x in hostname.split('|')), [])
-                    #connection_cache_key = '%s:%d' % (hostname or host, port)
-                    connection_cache_key = None
-                    timeout = 4
-                    remote = http_util.create_connection((host, port), timeout, cache_key=connection_cache_key)
-                    if remote is not None and data:
-                        remote.sendall(data)
-                        break
-                    elif i == 0:
-                        # only logging first create_connection error
-                        logging.error('http_util.create_connection((host=%r, port=%r), %r) timeout', host, port, timeout)
-                except NetWorkIOError as e:
-                    if e.args[0] == 9:
-                        logging.error('GAEProxyHandler direct forward remote (%r, %r) failed', host, port)
-                        continue
-                    else:
-                        raise
-            if hasattr(remote, 'fileno'):
-                # reset timeout default to avoid long http upload failure, but it will delay timeout retry :(
-                remote.settimeout(None)
-                http_util.forward_socket(self.connection, remote, bufsize=self.bufsize)
-        else:
-            hostip = random.choice(http_util.dns_resolve(host))
-            remote = http_util.create_connection((hostip, int(port)), timeout=4)
-            if not remote:
-                logging.error('GAEProxyHandler proxy connect remote (%r, %r) failed', host, port)
-                return
-            self.wfile.write(b'HTTP/1.1 200 OK\r\n\r\n')
-            http_util.forward_socket(self.connection, remote, bufsize=self.bufsize)
-
-    def do_CONNECT_AGENT(self):
-        """deploy fake cert to client"""
-        host, _, port = self.path.rpartition(':')
-        port = int(port)
-        certfile = CertUtil.get_cert(host)
-        logging.info('%s "AGENT %s %s:%d HTTP/1.1" - -', self.address_string(), self.command, host, port)
-        self.__realconnection = None
-        self.wfile.write(b'HTTP/1.1 200 OK\r\n\r\n')
-        try:
-            ssl_sock = ssl.wrap_socket(self.connection, keyfile=certfile, certfile=certfile, server_side=True)
-            # if not http_util.ssl_validate and not http_util.ssl_obfuscate:
-            #     ssl_sock = ssl.wrap_socket(self.connection, keyfile=certfile, certfile=certfile, server_side=True)
-            # else:
-            #     ssl_context = OpenSSL.SSL.Context(OpenSSL.SSL.TLSv1_METHOD)
-            #     ssl_context.use_privatekey_file(certfile)
-            #     ssl_context.use_certificate_file(certfile)
-            #     ssl_sock = SSLConnection(ssl_context, self.connection)
-            #     ssl_sock.set_accept_state()
-            #     ssl_sock.do_handshake()
-        except Exception as e:
-            if e.args[0] not in (errno.ECONNABORTED, errno.ECONNRESET):
-                logging.exception('ssl.wrap_socket(self.connection=%r) failed: %s', self.connection, e)
-            return
-        self.__realconnection = self.connection
-        self.__realwfile = self.wfile
-        self.__realrfile = self.rfile
-        self.connection = ssl_sock
-        self.rfile = self.connection.makefile('rb', self.bufsize)
-        self.wfile = self.connection.makefile('wb', 0)
-        try:
-            self.raw_requestline = self.rfile.readline(65537)
-            if len(self.raw_requestline) > 65536:
-                self.requestline = ''
-                self.request_version = ''
-                self.command = ''
-                self.send_error(414)
-                return
-            if not self.raw_requestline:
-                self.close_connection = 1
-                return
-            if not self.parse_request():
-                return
-        except NetWorkIOError as e:
-            if e.args[0] not in (errno.ECONNABORTED, errno.ECONNRESET, errno.EPIPE):
-                raise
-        if self.path[0] == '/' and host:
-            self.path = 'https://%s%s' % (self.headers['Host'], self.path)
-        try:
-            self.do_METHOD()
-        except NetWorkIOError as e:
-            if e.args[0] not in (errno.ECONNABORTED, errno.ETIMEDOUT, errno.EPIPE):
-                raise
-        finally:
-            if self.__realconnection:
-                try:
-                    self.__realconnection.shutdown(socket.SHUT_WR)
-                    self.__realconnection.close()
-                except NetWorkIOError:
-                    pass
-                finally:
-                    self.__realconnection = None
 
 
 def php_urlfetch(method, url, headers, payload, fetchserver, **kwargs):
