@@ -2865,7 +2865,7 @@ var autoproxy_host = {
     "coveralls.io": 1,
     "listjs.com": 1,
     "cdn.bitbucket.org": 1,
-    "1-apple.com.tw": 1
+    "1-apple.com.tw": 1,
     "zh.m.wikipedia.org": 1,
     "zh.netlog.com": 1,
     "zh.pokerstrategy.com": 1,
